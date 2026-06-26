@@ -1,0 +1,27 @@
+{
+  "name": "dotpass",
+  "version": "0.1.0",
+  "description": "Custom visibility rules for Obsidian files and folders.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "release": "npm run build"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "hidden-files",
+    "visibility"
+  ],
+  "author": "Blackfish <jiang76565206@gmail.com>",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.28.1",
+    "obsidian": "^1.5.12",
+    "tslib": "^2.6.2",
+    "typescript": "^5.4.3"
+  }
+}
