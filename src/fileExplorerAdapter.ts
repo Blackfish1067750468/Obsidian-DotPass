@@ -23,9 +23,7 @@ declare module "obsidian" {
 
 interface RevealAdapter extends DataAdapter {
   files?: Record<string, TAbstractFile>;
-  _exists?(fullPath: string, vaultPath: string): Promise<boolean>;
   getBasePath?(): string;
-  getFullPath?(normalizedPath: string): string;
   getRealPath?(normalizedPath: string): string;
   reconcileDeletion?: (realPath: string, vaultPath: string, ...args: unknown[]) => unknown;
   reconcileFileInternal?(realPath: string, vaultPath: string): Promise<void>;
@@ -39,8 +37,6 @@ type FileExplorerLeaf = {
   };
 };
 
-type RestoreFn = () => void;
-
 const NOTICE_TIMEOUT = 6000;
 const ALWAYS_EXCLUDED = new Set([".trash"]);
 
@@ -48,13 +44,13 @@ export class FileExplorerAdapter {
   private readonly app: App;
   private readonly plugin: DotpassPlugin;
   private readonly indexedPaths = new Set<string>();
-  private readonly patchRestorers: RestoreFn[] = [];
   private refreshTimer: number | null = null;
   private basePath = "";
   private isScanning = false;
   private layoutReady = false;
   private originalShowUnsupportedFiles: unknown = undefined;
   private originalI18nT: ((...args: unknown[]) => string) | null = null;
+  private originalReconcileDeletion: ((realPath: string, vaultPath: string, ...args: unknown[]) => unknown) | null = null;
 
   constructor(app: App, plugin: DotpassPlugin) {
     this.app = app;
@@ -86,7 +82,7 @@ export class FileExplorerAdapter {
       this.refreshTimer = null;
     }
 
-    document.querySelectorAll(".dotpass-hidden").forEach((element) => {
+    activeDocument.querySelectorAll(".dotpass-hidden").forEach((element) => {
       element.removeClass("dotpass-hidden");
       element.removeAttribute("data-dotpass-action");
     });
@@ -106,7 +102,7 @@ export class FileExplorerAdapter {
   }
 
   applyRules(): void {
-    document.querySelectorAll(".dotpass-hidden").forEach((element) => {
+    activeDocument.querySelectorAll(".dotpass-hidden").forEach((element) => {
       element.removeClass("dotpass-hidden");
       element.removeAttribute("data-dotpass-action");
     });
@@ -123,8 +119,7 @@ export class FileExplorerAdapter {
 
   refreshFileExplorer(): void {
     this.requestFileExplorerSort();
-    this.reconcileIndexedPaths();
-    if (this.shouldScanHiddenPaths()) {
+    if (this.shouldScanHiddenPaths() && !this.isScanning) {
       void this.enableHiddenFiles(false);
     }
     this.applyRulesSoon();
@@ -132,7 +127,6 @@ export class FileExplorerAdapter {
 
   async syncFileExplorer(showNotice = false): Promise<void> {
     this.requestFileExplorerSort();
-    this.reconcileIndexedPaths();
 
     if (this.shouldScanHiddenPaths()) {
       await this.enableHiddenFiles(showNotice);
@@ -186,7 +180,7 @@ export class FileExplorerAdapter {
     }
 
     if (!Platform.isDesktopApp || !this.isSupportedDesktopAdapter()) {
-      if (showNotice) new Notice("Dotpass hidden-file reveal requires Obsidian desktop FileSystemAdapter.", NOTICE_TIMEOUT);
+      if (showNotice) new Notice("Dotpass hidden-file reveal requires desktop FileSystemAdapter.", NOTICE_TIMEOUT);
       return;
     }
 
@@ -205,7 +199,20 @@ export class FileExplorerAdapter {
       this.rememberAndEnableUnsupportedFiles();
       this.patchAdapter();
       this.suppressDotfileWarning();
-      await this.rescanAdapter();
+
+      const discovered: string[] = [];
+      await this.walkVault("", discovered);
+      discovered.sort((a, b) => {
+        const depthDelta = a.split("/").length - b.split("/").length;
+        return depthDelta !== 0 ? depthDelta : a.localeCompare(b);
+      });
+
+      for (const vaultPath of discovered) {
+        if (this.shouldRevealVaultPath(vaultPath)) {
+          this.indexedPaths.add(vaultPath);
+          await this.showFile(vaultPath);
+        }
+      }
 
       this.applyRulesSoon();
 
@@ -224,33 +231,52 @@ export class FileExplorerAdapter {
     }
   }
 
-  async disableHiddenFiles(): Promise<void> {
-    for (const restore of this.patchRestorers.splice(0).reverse()) {
-      try {
-        restore();
-      } catch (error) {
-        console.error("[dotpass] failed to restore adapter patch", error);
-      }
+  private async walkVault(vaultPath: string, discovered: string[]): Promise<void> {
+    const diskPath = vaultPath ? path.join(this.basePath, vaultPath) : this.basePath;
+    let entries: fs.Dirent[];
+
+    try {
+      entries = await fs.promises.readdir(diskPath, { withFileTypes: true });
+    } catch {
+      return;
     }
 
-    const indexed = [...this.indexedPaths];
-    indexed.sort((left, right) => {
-      const depthDelta = right.split("/").length - left.split("/").length;
-      return depthDelta !== 0 ? depthDelta : right.localeCompare(left);
-    });
+    for (const entry of entries) {
+      const childPath = normalizePath(vaultPath ? `${vaultPath}/${entry.name}` : entry.name);
+      if (this.isIgnoredVaultPath(childPath)) continue;
 
-    for (let index = 0; index < indexed.length; index += 1) {
-      const vaultPath = indexed[index];
-      this.forgetIndexedPath(vaultPath);
-      if (index > 0 && index % 100 === 0) {
-        await waitForFrame();
+      if (this.isHiddenVaultPath(childPath)) {
+        discovered.push(childPath);
+      }
+
+      if (entry.isDirectory()) {
+        await this.walkVault(childPath, discovered);
+      }
+    }
+  }
+
+  async disableHiddenFiles(): Promise<void> {
+    const adapter = this.app.vault.adapter as RevealAdapter;
+    const originalDeletion = this.originalReconcileDeletion;
+
+    this.restoreAdapter();
+
+    if (originalDeletion && typeof adapter.getRealPath === "function") {
+      for (const vaultPath of [...this.indexedPaths]) {
+        try {
+          const realPath = adapter.getRealPath(vaultPath);
+          await (originalDeletion(realPath, vaultPath) as Promise<void>);
+        } catch {
+          // already gone or not applicable
+        }
       }
     }
 
     this.indexedPaths.clear();
     this.restoreDotfileWarning();
     this.restoreUnsupportedFiles();
-    this.applyRulesSoon();
+    this.requestFileExplorerSort();
+    this.applyRules();
   }
 
   private isSupportedDesktopAdapter(): boolean {
@@ -292,203 +318,38 @@ export class FileExplorerAdapter {
   }
 
   private patchAdapter(): void {
-    if (!this.isSupportedDesktopAdapter() || this.patchRestorers.length > 0) return;
+    if (!this.isSupportedDesktopAdapter() || this.originalReconcileDeletion) return;
 
-    this.patchReconcileDeletion();
-  }
-
-  private patchReconcileDeletion(): void {
     const adapter = this.app.vault.adapter as RevealAdapter;
     if (typeof adapter.reconcileDeletion !== "function") return;
 
-    const original = adapter.reconcileDeletion;
-    const self = this;
+    this.originalReconcileDeletion = adapter.reconcileDeletion.bind(adapter);
+    const origDeletion = this.originalReconcileDeletion;
 
-    adapter.reconcileDeletion = function (realPath: string, vaultPath: string, ...args: unknown[]): unknown {
-      if (self.shouldRevealVaultPath(vaultPath)) {
-        void self.revealPath(vaultPath);
+    adapter.reconcileDeletion = (realPath: string, vaultPath: string, ...args: unknown[]): unknown => {
+      if (this.shouldRevealVaultPath(vaultPath)) {
+        this.indexedPaths.add(vaultPath);
+        void this.showFile(vaultPath);
         return;
       }
-      return original.call(this, realPath, vaultPath, ...args);
+      return origDeletion!(realPath, vaultPath, ...args);
     };
-
-    this.patchRestorers.push(() => {
-      adapter.reconcileDeletion = original;
-    });
   }
 
-  private async walkVault(vaultPath: string, discovered: string[]): Promise<void> {
-    const diskPath = vaultPath ? path.join(this.basePath, vaultPath) : this.basePath;
-    let entries: fs.Dirent[];
+  private restoreAdapter(): void {
+    if (!this.originalReconcileDeletion) return;
 
-    try {
-      entries = await fs.promises.readdir(diskPath, { withFileTypes: true });
-    } catch (error) {
-      console.warn(`[dotpass] unable to read ${vaultPath || "/"}`, error);
-      return;
-    }
-
-    for (const entry of entries) {
-      const childPath = normalizePath(vaultPath ? `${vaultPath}/${entry.name}` : entry.name);
-      if (this.isIgnoredVaultPath(childPath)) continue;
-
-      if (this.isHiddenVaultPath(childPath) && this.shouldRevealVaultPath(childPath)) {
-        discovered.push(childPath);
-      }
-
-      if (entry.isDirectory()) {
-        await this.walkVault(childPath, discovered);
-      }
-    }
+    const adapter = this.app.vault.adapter as RevealAdapter;
+    adapter.reconcileDeletion = this.originalReconcileDeletion;
+    this.originalReconcileDeletion = null;
   }
 
-  private async revealPath(vaultPath: string, forceSupportingAncestor = false): Promise<TAbstractFile | null> {
-    const normalized = normalizePath(vaultPath);
-    if (!normalized || this.isIgnoredVaultPath(normalized) || (!forceSupportingAncestor && !this.shouldRevealVaultPath(normalized))) {
-      return null;
-    }
-
-    const existing = this.app.vault.getAbstractFileByPath(normalized);
-    if (existing) {
-      this.indexedPaths.add(normalized);
-      return existing;
-    }
-
+  private async showFile(vaultPath: string): Promise<void> {
     const adapter = this.app.vault.adapter as RevealAdapter;
     if (typeof adapter.reconcileFileInternal === "function") {
-      try {
-        await this.revealParentPath(normalized);
-        await adapter.reconcileFileInternal(this.getRealPath(normalized), normalized);
-        const reconciled = this.app.vault.getAbstractFileByPath(normalized);
-        if (reconciled) {
-          this.indexedPaths.add(normalized);
-          return reconciled;
-        }
-      } catch (error) {
-        console.warn(`[dotpass] reconcileFileInternal failed for ${normalized}`, error);
-      }
+      const realPath = this.getRealPath(vaultPath);
+      await adapter.reconcileFileInternal(realPath, vaultPath);
     }
-
-    const stat = this.statVaultPath(normalized);
-    if (!stat) return null;
-
-    const parent = await this.ensureParentFolder(normalized);
-    if (!parent) return null;
-
-    const basename = path.posix.basename(normalized);
-    const abstractFile = Object.create(stat.isDirectory() ? TFolder.prototype : TFile.prototype) as TAbstractFile & {
-      name: string;
-      parent: TFolder;
-      path: string;
-      vault: App["vault"];
-      stat?: { ctime: number; mtime: number; size: number };
-      children?: TAbstractFile[];
-      basename?: string;
-      extension?: string;
-    };
-
-    abstractFile.name = basename;
-    abstractFile.parent = parent;
-    abstractFile.path = normalized;
-    abstractFile.vault = this.app.vault;
-
-    if (stat.isDirectory()) {
-      const folder = abstractFile as TFolder & { children: TAbstractFile[] };
-      folder.children = [];
-    } else {
-      const file = abstractFile as TFile & { basename: string; extension: string; stat: { ctime: number; mtime: number; size: number } };
-      const extensionIndex = basename.lastIndexOf(".");
-      file.basename = extensionIndex > 0 ? basename.slice(0, extensionIndex) : basename;
-      file.extension = extensionIndex > 0 ? basename.slice(extensionIndex + 1) : "";
-      file.stat = {
-        ctime: stat.birthtimeMs,
-        mtime: stat.mtimeMs,
-        size: stat.size,
-      };
-    }
-
-    this.registerVaultItem(parent, abstractFile);
-    this.indexedPaths.add(normalized);
-    return abstractFile;
-  }
-
-  private async revealParentPath(vaultPath: string): Promise<TAbstractFile | null> {
-    const parentPath = path.posix.dirname(vaultPath);
-    if (!parentPath || parentPath === ".") {
-      return this.app.vault.getRoot();
-    }
-
-    const existing = this.app.vault.getAbstractFileByPath(parentPath);
-    if (existing) return existing;
-
-    return this.revealPath(parentPath, true);
-  }
-
-  private async ensureParentFolder(vaultPath: string): Promise<TFolder | null> {
-    const parentPath = path.posix.dirname(vaultPath);
-    if (!parentPath || parentPath === ".") {
-      return this.app.vault.getRoot();
-    }
-
-    const existing = this.app.vault.getAbstractFileByPath(parentPath);
-    if (existing instanceof TFolder) return existing;
-
-    const stat = this.statVaultPath(parentPath);
-    if (!stat?.isDirectory()) return null;
-
-    const revealed = await this.revealPath(parentPath, true);
-    return revealed instanceof TFolder ? revealed : null;
-  }
-
-  private registerVaultItem(parent: TFolder, item: TAbstractFile): void {
-    const adapter = this.app.vault.adapter as RevealAdapter;
-    if (adapter.files) {
-      adapter.files[item.path] = item;
-    }
-
-    if (!parent.children.some((child) => child.path === item.path)) {
-      parent.children.push(item);
-      parent.children.sort((left, right) => left.name.localeCompare(right.name));
-    }
-
-    const metadataCache = this.app.metadataCache as { trigger?: (...args: unknown[]) => void };
-    metadataCache.trigger?.("changed", item, "", undefined);
-  }
-
-  private statVaultPath(vaultPath: string): fs.Stats | null {
-    try {
-      return fs.lstatSync(path.join(this.basePath, vaultPath));
-    } catch (error) {
-      console.warn(`[dotpass] unable to stat ${vaultPath}`, error);
-      return null;
-    }
-  }
-
-  private forgetIndexedPath(vaultPath: string): void {
-    const adapter = this.app.vault.adapter as RevealAdapter;
-    const abstractFile = this.app.vault.getAbstractFileByPath(vaultPath);
-
-    if (adapter.files) {
-      delete adapter.files[vaultPath];
-    }
-
-    this.indexedPaths.delete(vaultPath);
-
-    if (abstractFile?.parent) {
-      abstractFile.parent.children = abstractFile.parent.children.filter((child) => child.path !== vaultPath);
-    }
-
-    const metadataCache = this.app.metadataCache as { trigger?: (...args: unknown[]) => void };
-    if (abstractFile) {
-      metadataCache.trigger?.("deleted", abstractFile);
-    }
-  }
-
-  private isHiddenVaultPath(vaultPath: string): boolean {
-    return normalizePath(vaultPath)
-      .split("/")
-      .filter(Boolean)
-      .some((segment) => segment.startsWith("."));
   }
 
   private shouldRevealVaultPath(vaultPath: string): boolean {
@@ -506,16 +367,18 @@ export class FileExplorerAdapter {
   }
 
   private hasShownAncestorFolder(vaultPath: string): boolean {
-    let parentPath = path.posix.dirname(normalizePath(vaultPath));
+    const posix = normalizePath(vaultPath);
+    let parentPath = posix.includes("/") ? posix.slice(0, posix.lastIndexOf("/")) : "";
 
-    while (parentPath && parentPath !== ".") {
+    while (parentPath) {
       if (this.isIgnoredVaultPath(parentPath)) return false;
 
       const evaluation = evaluateVisibility(this.plugin.settings, createTargetInfo(parentPath, "folder"));
       if (evaluation.action === "hide") return false;
       if (evaluation.action === "show") return true;
 
-      parentPath = path.posix.dirname(parentPath);
+      const slashIndex = parentPath.lastIndexOf("/");
+      parentPath = slashIndex > 0 ? parentPath.slice(0, slashIndex) : "";
     }
 
     return false;
@@ -531,17 +394,11 @@ export class FileExplorerAdapter {
     return this.plugin.settings.rules.some((rule) => rule.enabled && rule.action === "show");
   }
 
-  private reconcileIndexedPaths(): void {
-    for (const vaultPath of [...this.indexedPaths]) {
-      if (!this.shouldRevealVaultPath(vaultPath) && !this.hasRevealedDescendant(vaultPath)) {
-        this.forgetIndexedPath(vaultPath);
-      }
-    }
-  }
-
-  private hasRevealedDescendant(vaultPath: string): boolean {
-    const prefix = `${normalizePath(vaultPath)}/`;
-    return [...this.indexedPaths].some((indexedPath) => indexedPath.startsWith(prefix) && this.shouldRevealVaultPath(indexedPath));
+  private isHiddenVaultPath(vaultPath: string): boolean {
+    return normalizePath(vaultPath)
+      .split("/")
+      .filter(Boolean)
+      .some((segment) => segment.startsWith("."));
   }
 
   private isIgnoredVaultPath(vaultPath: string): boolean {
@@ -556,8 +413,12 @@ export class FileExplorerAdapter {
     if (abstractFile instanceof TFolder) return "folder";
     if (abstractFile instanceof TFile) return "file";
 
-    const stat = this.statVaultPath(vaultPath);
-    return stat?.isDirectory() ? "folder" : "file";
+    try {
+      const stat = fs.lstatSync(path.join(this.basePath, vaultPath));
+      return stat.isDirectory() ? "folder" : "file";
+    } catch {
+      return "file";
+    }
   }
 
   private applyRuleToFileItem(file: TAbstractFile): void {
@@ -588,7 +449,7 @@ export class FileExplorerAdapter {
 
     const elements = new Set<HTMLElement>();
     selectors.forEach((selector) => {
-      document.querySelectorAll<HTMLElement>(selector).forEach((element) => elements.add(element));
+      activeDocument.querySelectorAll<HTMLElement>(selector).forEach((element) => elements.add(element));
     });
 
     const privateItem = this.findPrivateFileItem(vaultPath);
@@ -623,15 +484,14 @@ export class FileExplorerAdapter {
     };
     if (!win.i18next || this.originalI18nT) return;
 
-    this.originalI18nT = win.i18next.t.bind(win.i18next);
-    const originalI18nT = this.originalI18nT;
-    if (!originalI18nT) return;
+    const boundT: (...args: unknown[]) => string = win.i18next.t.bind(win.i18next);
+    this.originalI18nT = boundT;
 
-    win.i18next.t = function (...args: unknown[]): string {
+    win.i18next.t = (...args: unknown[]): string => {
       if (args[0] === "plugins.file-explorer.msg-bad-dotfile") {
         return "";
       }
-      return originalI18nT(...args);
+      return boundT(...args);
     };
   }
 
@@ -647,36 +507,12 @@ export class FileExplorerAdapter {
     this.originalI18nT = null;
   }
 
-  private async rescanAdapter(): Promise<void> {
-    const adapter = this.app.vault.adapter as RevealAdapter;
-    if (typeof adapter.listRecursive === "function") {
-      await adapter.listRecursive("");
-      return;
-    }
-
-    const discovered: string[] = [];
-    await this.walkVault("", discovered);
-    discovered.sort((left, right) => {
-      const depthDelta = left.split("/").length - right.split("/").length;
-      return depthDelta !== 0 ? depthDelta : left.localeCompare(right);
-    });
-
-    for (const vaultPath of discovered) {
-      await this.revealPath(vaultPath);
-    }
-  }
-
   private getRealPath(vaultPath: string): string {
     const adapter = this.app.vault.adapter as RevealAdapter;
     if (typeof adapter.getRealPath === "function") {
       return adapter.getRealPath(vaultPath);
     }
-
-    if (typeof adapter.getFullPath === "function") {
-      return adapter.getFullPath(vaultPath);
-    }
-
-    return path.join(this.basePath, vaultPath);
+    return vaultPath;
   }
 }
 
@@ -687,8 +523,4 @@ function cssEscape(value: string): string {
 
 function ownKeys(value: Record<string, unknown> | null | undefined): string[] {
   return value ? Object.getOwnPropertyNames(value).sort() : [];
-}
-
-function waitForFrame(): Promise<void> {
-  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
 }

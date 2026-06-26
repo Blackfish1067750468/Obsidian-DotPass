@@ -1,12 +1,10 @@
 {
   "id": "dotpass",
   "name": "Dotpass",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minAppVersion": "1.5.0",
-  "description": "Simple show and hide rules for Obsidian files and folders, including dot-prefixed hidden items.",
+  "description": "Show and hide files and folders in the file explorer with flexible rules, including dot-prefixed hidden items.",
   "author": "Blackfish",
   "authorUrl": "https://github.com/Blackfish1067750468",
-  "isDesktopOnly": true,
-  "js": "main.js",
-  "css": "styles.css"
+  "isDesktopOnly": true
 }

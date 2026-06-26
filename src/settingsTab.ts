@@ -38,7 +38,7 @@ export class DotpassSettingTab extends PluginSettingTab {
 
     containerEl.empty();
     const titleBar = containerEl.createDiv("dotpass-title-bar");
-    titleBar.createEl("h2", { text: t("settingsTitle") });
+    new Setting(titleBar).setName(t("settingsTitle")).setHeading();
     const helpIcon = titleBar.createSpan("dotpass-help-icon");
     helpIcon.ariaLabel = t("help");
     helpIcon.title = t("help");
@@ -162,7 +162,7 @@ export class DotpassSettingTab extends PluginSettingTab {
       row.addClass("is-drag-over");
     });
     row.addEventListener("dragleave", () => row.removeClass("is-drag-over"));
-    row.addEventListener("drop", async (event) => {
+    row.addEventListener("drop", (event) => {
       event.preventDefault();
       row.removeClass("is-drag-over");
       const sourceId = event.dataTransfer?.getData("text/plain");
@@ -170,8 +170,7 @@ export class DotpassSettingTab extends PluginSettingTab {
       if (!sourceId || sourceTarget !== target || sourceId === rule.id) return;
 
       reorderRules(this.plugin.settings.rules, target, sourceId, rule.id);
-      await this.plugin.saveSettingsAndApply();
-      this.display();
+      void this.plugin.saveSettingsAndApply().then(() => this.display());
     });
 
     const handle = row.createSpan("dotpass-drag-handle");
